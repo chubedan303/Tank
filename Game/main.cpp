@@ -3,6 +3,7 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include <SDL2/SDL_image.h>
+#include <SDL2/SDL_mixer.h>
 #include <fstream>
 
 const int SCREEN_WIDTH = 800;
@@ -10,7 +11,7 @@ const int SCREEN_HEIGHT = 640;
 const int TILE_SIZE = 40;
 const int TANK_SIZE = 30;
 const int MOVE_DELAY = 40;
-const double BULLET_SPEED = 0.25;
+const double BULLET_SPEED = 0.4;
 const int BULLET_SIZE = 20;
 const int MAP_WIDTH = 800;
 const int MAP_HEIGHT = 600;
@@ -19,7 +20,9 @@ int score = 0;
 int enemiestank = 0;
 bool running = true;
 bool inMenu = true;
-bool gameOver = false; // New flag to track game over state
+bool gameOver = false;
+bool twoPlayerMode = false;
+
 SDL_Window* window = nullptr;
 SDL_Renderer* renderer = nullptr;
 
@@ -43,14 +46,19 @@ SDL_Texture* backgroundTexture = nullptr;
 
 SDL_Texture* menuTexture = nullptr;
 SDL_Rect startButtonRect;
-SDL_Rect continueButtonRect;  // New button for continuing
+SDL_Rect onePlayerButtonRect;
+SDL_Rect twoPlayerButtonRect;
+SDL_Texture* onePlayerTextTexture = nullptr;
+SDL_Texture* twoPlayerTextTexture = nullptr;
+SDL_Rect onePlayerTextRect;
+SDL_Rect twoPlayerTextRect;
 
 TTF_Font* menuFont = nullptr;
 SDL_Color textColor = { 255, 255, 255 };
 SDL_Texture* startTextTexture = nullptr;
 SDL_Rect startTextRect;
-SDL_Texture* continueTextTexture = nullptr; // Text texture for continue button
-SDL_Rect continueTextRect;
+
+Mix_Chunk* shootSound = nullptr;
 
 SDL_Texture* loadTexture(const std::string& path, SDL_Renderer* renderer) {
     SDL_Surface* surface = IMG_Load(path.c_str());
@@ -153,7 +161,8 @@ struct EnemyTank {
     SDL_Texture* directionTexture;
     Uint32 lastMoveTime;
     int moveCounter;
-    int moveDirection; // 0: up, 1: down, 2: left, 3: right
+    int moveDirection;
+    Uint32 shootInterval;
 
     EnemyTank(int startX, int startY) {
         x = startX;
@@ -166,7 +175,8 @@ struct EnemyTank {
         rect = { x, y, TANK_SIZE, TANK_SIZE };
         lastMoveTime = SDL_GetTicks();
         moveCounter = 0;
-        moveDirection = rand() % 4;  // Random initial direction
+        moveDirection = rand() % 4;
+        shootInterval = 2000 + rand() % 2001;
     }
     void updateBullets() {
         for (auto it = enemyBullets.begin(); it != enemyBullets.end();) {
@@ -179,22 +189,31 @@ struct EnemyTank {
             }
         }
     }
+
     bool canMove(int dx, int dy) {
         int newX = x + dx * 4;
         int newY = y + dy * 4;
-        int mapX = (newX + 20) / TILE_SIZE;
-        int mapY = (newY + 20) / TILE_SIZE;
-        int mapX2 = (newX) / TILE_SIZE;
-        int mapY2 = (newY) / TILE_SIZE;
 
-        if (newX < 0 || newX >= SCREEN_WIDTH || newY < 0 || newY >= SCREEN_HEIGHT) {
+        // Check for out-of-bounds movement
+        if (newX < 0 || newX + TANK_SIZE > SCREEN_WIDTH || newY < 0 || newY + TANK_SIZE > SCREEN_HEIGHT) {
             return false;
         }
 
-        return (mapY >= 0 && mapY < 20 && mapX >= 0 && mapX < 25 && map[mapY][mapX] == 0
-            && mapY2 >= 0 && mapY2 < 20 && mapX2 >= 0 && mapX2 < 25 && map[mapY2][mapX2] == 0
-            && mapY >= 0 && mapY < 20 && mapX2 >= 0 && mapX2 < 25 && map[mapY][mapX2] == 0
-            && mapY2 >= 0 && mapY2 < 20 && mapX >= 0 && mapX < 25 && map[mapY2][mapX] == 0);
+        int mapXStart = newX / TILE_SIZE;
+        int mapYStart = newY / TILE_SIZE;
+        int mapXEnd = (newX + TANK_SIZE - 1) / TILE_SIZE;
+        int mapYEnd = (newY + TANK_SIZE - 1) / TILE_SIZE;
+
+        for (int i = mapYStart; i <= mapYEnd; ++i) {
+            for (int j = mapXStart; j <= mapXEnd; ++j) {
+                if (i < 0 || i >= 20 || j < 0 || j >= 25) continue; // Ignore out-of-bounds tiles
+
+                if (map[i][j] != 0) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     void move(int dx, int dy) {
@@ -239,11 +258,16 @@ struct EnemyTank {
 
     void shootIfReady() {
         Uint32 currentTime = SDL_GetTicks();
-        if (currentTime - lastShotTime >= 1000) {
+
+        if (currentTime - lastShotTime >= shootInterval) {
             enemyBullets.emplace_back(x + TANK_SIZE / 2 - BULLET_SIZE / 2,
                 y + TANK_SIZE / 2 - BULLET_SIZE / 2,
                 dirX * BULLET_SPEED, dirY * BULLET_SPEED);
+            if (shootSound != nullptr) {
+                Mix_PlayChannel(-1, shootSound, 0);
+            }
             lastShotTime = currentTime;
+            shootInterval = 2000 + (rand() % 3) * 1000;
         }
     }
     void draw() {
@@ -263,16 +287,17 @@ struct Tank {
     int hp = 3;
     const int maxHp = 5;
     int startX, startY;
+    int heartXOffset; // Offset for drawing hearts
     void drawHearts() {
-        SDL_Rect heartRect = { 10, 10, 20, 20 };
+        SDL_Rect heartRect = { 10 + heartXOffset, 10, 20, 20 };
         for (int i = 0; i < hp; ++i) {
-            heartRect.x = 10 + i * 25;
+            heartRect.x = 10 + heartXOffset + i * 25;
             SDL_RenderCopy(renderer, heartTexture, NULL, &heartRect);
         }
     }
     Uint32 lastShotTime = 0;
     const Uint32 shootCooldown = 500;
-    Tank(int startX, int startY) : startX(startX), startY(startY), x(startX), y(startY) {
+    Tank(int startX, int startY, int heartOffset = 0) : startX(startX), startY(startY), x(startX), y(startY), heartXOffset(heartOffset) {
         rect = { x, y, TANK_SIZE, TANK_SIZE };
         directionTexture = tankDownTexture;
         dirX = 0;
@@ -302,18 +327,31 @@ struct Tank {
     bool canMove(int dx, int dy) {
         int newX = x + dx * 4;
         int newY = y + dy * 4;
-        int mapX = (newX + 20) / 40;
-        int mapY = (newY + 20) / 40;
-        int mapX2 = (newX) / 40;
-        int mapY2 = (newY) / 40;
-        if (newX < 0 || newX >= SCREEN_WIDTH || newY < 0 || newY >= SCREEN_HEIGHT) {
+
+        // Check for out-of-bounds movement
+        if (newX < 0 || newX + TANK_SIZE > SCREEN_WIDTH || newY < 0 || newY + TANK_SIZE > SCREEN_HEIGHT) {
             return false;
         }
-        return (mapY >= 0 && mapY < 20 && mapX >= 0 && mapX < 25 && map[mapY][mapX] == 0
-            && mapY2 >= 0 && mapY2 < 20 && mapX2 >= 0 && mapX2 < 25 && map[mapY2][mapX2] == 0
-            && mapY >= 0 && mapY < 20 && mapX2 >= 0 && mapX2 < 25 && map[mapY][mapX2] == 0
-            && mapY2 >= 0 && mapY2 < 20 && mapX >= 0 && mapX < 25 && map[mapY2][mapX] == 0);
+
+        int mapXStart = newX / TILE_SIZE;
+        int mapYStart = newY / TILE_SIZE;
+        int mapXEnd = (newX + TANK_SIZE - 1) / TILE_SIZE;
+        int mapYEnd = (newY + TANK_SIZE - 1) / TILE_SIZE;
+
+        for (int i = mapYStart; i <= mapYEnd; ++i) {
+            for (int j = mapXStart; j <= mapXEnd; ++j) {
+                if (i < 0 || i >= 20 || j < 0 || j >= 25) continue; // Ignore out-of-bounds tiles
+
+                if (map[i][j] != 0) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
+
+
     void move(int dx, int dy, SDL_Texture* newTexture) {
         directionTexture = newTexture;
         dirX = dx;
@@ -331,6 +369,9 @@ struct Tank {
             bullets.emplace_back(x + TANK_SIZE / 2 - BULLET_SIZE / 2,
                 y + TANK_SIZE / 2 - BULLET_SIZE / 2,
                 dirX, dirY);
+            if (shootSound != nullptr) {
+                Mix_PlayChannel(-1, shootSound, 0);
+            }
             lastShotTime = currentTime;
         }
     }
@@ -339,14 +380,15 @@ struct Tank {
     }
 };
 
-Tank player(TILE_SIZE, TILE_SIZE);
+Tank player(TILE_SIZE, TILE_SIZE, 0); // Player 1, hearts start at x=10
+Tank player2(SCREEN_WIDTH - 4*TILE_SIZE, TILE_SIZE, 200); // Player 2, hearts start at x=200 (adjust as needed)
 
 struct GiftBox {
     int x, y;
     SDL_Rect rect;
     bool active;
     GiftBox(int startX, int startY) : x(startX), y(startY), active(true) {
-        rect = { x, y, TILE_SIZE, TILE_SIZE };
+        rect = { x, y, TILE_SIZE / 4 * 3, TILE_SIZE / 4 * 3 };
     }
 
     void draw(SDL_Renderer* renderer, SDL_Texture* texture) {
@@ -361,13 +403,24 @@ Uint32 giftSpawnTime = 0;
 const Uint32 giftSpawnDelay = 10000;
 
 bool init() {
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) return false;
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) return false;
     window = SDL_CreateWindow("Tank", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_SHOWN);
     if (!window) return false;
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     if (!renderer) return false;
     if (TTF_Init() == -1) {
         std::cerr << "Failed to initialize TTF: " << TTF_GetError() << std::endl;
+        return false;
+    }
+
+    if (Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 2048) < 0) {
+        std::cerr << "SDL_mixer could not initialize! SDL_mixer Error: %s\n", Mix_GetError();
+        return false;
+    }
+
+    shootSound = Mix_LoadWAV("shoot.wav");
+    if (shootSound == nullptr) {
+        std::cerr << "Failed to load shoot sound: " << Mix_GetError() << std::endl;
         return false;
     }
 
@@ -390,18 +443,23 @@ bool init() {
     menuTexture = loadTexture("menu.png", renderer);
 
     startButtonRect.x = SCREEN_WIDTH / 2 - 100;
-    startButtonRect.y = SCREEN_HEIGHT / 2 - 100;  // Moved start button up
+    startButtonRect.y = SCREEN_HEIGHT / 2 - 100;
     startButtonRect.w = 200;
     startButtonRect.h = 60;
 
-    continueButtonRect.x = SCREEN_WIDTH / 2 - 100;
-    continueButtonRect.y = SCREEN_HEIGHT / 2 + 20; // Positioned below start
-    continueButtonRect.w = 200;
-    continueButtonRect.h = 60;
+    onePlayerButtonRect.x = SCREEN_WIDTH / 2 - 150;
+    onePlayerButtonRect.y = SCREEN_HEIGHT / 2 - 50;
+    onePlayerButtonRect.w = 300;
+    onePlayerButtonRect.h = 60;
+
+    twoPlayerButtonRect.x = SCREEN_WIDTH / 2 - 150;
+    twoPlayerButtonRect.y = SCREEN_HEIGHT / 2 + 50;
+    twoPlayerButtonRect.w = 300;
+    twoPlayerButtonRect.h = 60;
 
     menuFont = TTF_OpenFont("NothingYouCouldDo.ttf", 36);
     if (!menuFont) {
-        std::cerr << "Failed to load font: " << TTF_GetError() << std::endl;
+        std::cerr << "Failed to initialize TTF: " << TTF_GetError() << std::endl;
         return false;
     }
 
@@ -417,19 +475,31 @@ bool init() {
     startTextRect.y = startButtonRect.y + (startButtonRect.h - startTextRect.h) / 2;
     SDL_FreeSurface(textSurface);
 
-    SDL_Surface* continueSurface = TTF_RenderText_Solid(menuFont, "Continue", textColor);
-    if (!continueSurface) {
-        std::cerr << "Failed to render continue text: " << TTF_GetError() << std::endl;
+    SDL_Surface* onePlayerSurface = TTF_RenderText_Solid(menuFont, "1 Player", textColor);
+    if (!onePlayerSurface) {
+        std::cerr << "Failed to render '1 Player' text: " << TTF_GetError() << std::endl;
         return false;
     }
-    continueTextTexture = SDL_CreateTextureFromSurface(renderer, continueSurface);
-    continueTextRect.w = continueSurface->w;
-    continueTextRect.h = continueSurface->h;
-    continueTextRect.x = continueButtonRect.x + (continueButtonRect.w - continueTextRect.w) / 2;
-    continueTextRect.y = continueButtonRect.y + (continueButtonRect.h - continueTextRect.h) / 2;
-    SDL_FreeSurface(continueSurface);
+    onePlayerTextTexture = SDL_CreateTextureFromSurface(renderer, onePlayerSurface);
+    onePlayerTextRect.w = onePlayerSurface->w;
+    onePlayerTextRect.h = onePlayerSurface->h;
+    onePlayerTextRect.x = onePlayerButtonRect.x + (onePlayerButtonRect.w - onePlayerTextRect.w) / 2;
+    onePlayerTextRect.y = onePlayerButtonRect.y + (onePlayerButtonRect.h - onePlayerTextRect.h) / 2;
+    SDL_FreeSurface(onePlayerSurface);
 
-    return tankUpTexture && tankDownTexture && tankLeftTexture && tankRightTexture && menuTexture && startTextTexture && continueTextTexture && giftTexture && backgroundTexture;
+    SDL_Surface* twoPlayerSurface = TTF_RenderText_Solid(menuFont, "2 Players", textColor);
+    if (!twoPlayerSurface) {
+        std::cerr << "Failed to render '2 Players' text: " << TTF_GetError() << std::endl;
+        return false;
+    }
+    twoPlayerTextTexture = SDL_CreateTextureFromSurface(renderer, twoPlayerSurface);
+    twoPlayerTextRect.w = twoPlayerSurface->w;
+    twoPlayerTextRect.h = twoPlayerSurface->h;
+    twoPlayerTextRect.x = twoPlayerButtonRect.x + (twoPlayerButtonRect.w - twoPlayerTextRect.w) / 2;
+    twoPlayerTextRect.y = twoPlayerButtonRect.y + (twoPlayerButtonRect.h - twoPlayerTextRect.h) / 2;
+    SDL_FreeSurface(twoPlayerSurface);
+
+    return tankUpTexture && tankDownTexture && tankLeftTexture && tankRightTexture && menuTexture && startTextTexture && giftTexture && backgroundTexture && shootSound && onePlayerTextTexture && twoPlayerTextTexture;
 }
 
 void drawMap(SDL_Renderer* renderer) {
@@ -457,17 +527,36 @@ void drawMap(SDL_Renderer* renderer) {
     }
 }
 
-bool isValidSpawnPosition(int x, int y, const Tank& player, const int map[20][25]) {
+bool isValidSpawnPosition(int x, int y, const Tank& player,const Tank& player2, const int map[20][25]) {
+    SDL_Rect spawnRect = { x, y, TANK_SIZE, TANK_SIZE };
+    if (SDL_HasIntersection(&spawnRect, &player.rect)|| SDL_HasIntersection(&spawnRect, &player2.rect)) return false;
+
+    int mapXStart = x / TILE_SIZE;
+    int mapYStart = y / TILE_SIZE;
+    int mapXEnd = (x + TANK_SIZE - 1) / TILE_SIZE;
+    int mapYEnd = (y + TANK_SIZE - 1) / TILE_SIZE;
+
+    for (int i = mapYStart; i <= mapYEnd; ++i) {
+        for (int j = mapXStart; j <= mapXEnd; ++j) {
+            if (i < 0 || i >= 20 || j < 0 || j >= 25) return false;
+            if (map[i][j] != 0) return false;
+        }
+    }
+
+    return true;
+}
+
+bool isValidPlayer2Spawn(int x, int y, const Tank& player, const int map[20][25]) {
     SDL_Rect spawnRect = { x, y, TANK_SIZE, TANK_SIZE };
     if (SDL_HasIntersection(&spawnRect, &player.rect)) return false;
 
-    int startMapX = x / TILE_SIZE;
-    int startMapY = y / TILE_SIZE;
-    int endMapX = (x + TANK_SIZE - 1) / TILE_SIZE;
-    int endMapY = (y + TANK_SIZE - 1) / TILE_SIZE;
+    int mapXStart = x / TILE_SIZE;
+    int mapYStart = y / TILE_SIZE;
+    int mapXEnd = (x + TANK_SIZE - 1) / TILE_SIZE;
+    int mapYEnd = (y + TANK_SIZE - 1) / TILE_SIZE;
 
-    for (int i = startMapY; i <= endMapY; ++i) {
-        for (int j = startMapX; j <= endMapX; ++j) {
+    for (int i = mapYStart; i <= mapYEnd; ++i) {
+        for (int j = mapXStart; j <= mapXEnd; ++j) {
             if (i < 0 || i >= 20 || j < 0 || j >= 25) return false;
             if (map[i][j] != 0) return false;
         }
@@ -476,23 +565,24 @@ bool isValidSpawnPosition(int x, int y, const Tank& player, const int map[20][25
     return true;
 }
 
-bool isValidSpawnPosition(int x, int y, const int map[20][25]) {
-    int startMapX = x / TILE_SIZE;
-    int startMapY = y / TILE_SIZE;
-    int endMapX = (x + TILE_SIZE - 1) / TILE_SIZE;
-    int endMapY = (y + TILE_SIZE - 1) / TILE_SIZE;
 
-    for (int i = startMapY; i <= endMapY; ++i) {
-        for (int j = startMapX; j <= endMapX; ++j) {
-            if (i < 0 || i >= 20 || j < 0 || j >= 25) return false;
-            if (map[i][j] != 0) return false;
-        }
+//Check if a given x,y coordinate (pixel) is a valid spawn position for the giftbox.
+
+bool isValidGiftSpawnPosition(int x, int y, const int map[20][25]) {
+    int mapX = x / TILE_SIZE;
+    int mapY = y / TILE_SIZE;
+
+    // Check if the map tile is within the bounds of the map
+    if (mapX < 0 || mapX >= 25 || mapY < 0 || mapY >= 20) {
+        return false;
     }
 
-    return true;
+    // Check if the tile at map[mapY][mapX] is equal to 0 (empty ground)
+    return map[mapY][mapX] == 0;
 }
 
-void spawnNewEnemy(Tank& player, int map[20][25]) {
+
+void spawnNewEnemy(Tank& player, Tank& player2, int map[20][25]) {
     int x, y;
     bool validSpawn = false;
     const int MAX_ATTEMPTS = 1000;
@@ -501,7 +591,8 @@ void spawnNewEnemy(Tank& player, int map[20][25]) {
         x = rand() % (SCREEN_WIDTH - TANK_SIZE);
         y = rand() % (SCREEN_HEIGHT - TANK_SIZE);
 
-        if (isValidSpawnPosition(x, y, player, map)) {
+        // Kiểm tra với cả player1 và player2
+        if (isValidSpawnPosition(x, y, player,player2, map)) {
             validSpawn = true;
             break;
         }
@@ -523,10 +614,10 @@ void spawnGiftBox() {
         const int MAX_ATTEMPTS = 1000;
 
         for (int i = 0; i < MAX_ATTEMPTS; ++i) {
-            x = rand() % (SCREEN_WIDTH - TILE_SIZE);
-            y = rand() % (SCREEN_HEIGHT - TILE_SIZE);
+            x = (rand() % 25) * TILE_SIZE; // ensure alignment with tile grid
+            y = (rand() % 20) * TILE_SIZE; // ensure alignment with tile grid
 
-            if (isValidSpawnPosition(x, y, map)) {
+            if (isValidGiftSpawnPosition(x, y, map)) {
                 validSpawn = true;
                 break;
             }
@@ -543,7 +634,7 @@ void spawnGiftBox() {
 }
 
 
-void checkBulletCollisions(Tank& player, int map[20][25]) {
+void checkBulletCollisions(Tank& player, Tank& player2, int map[20][25]) {
     for (auto it_enemy = enemies.begin(); it_enemy != enemies.end();) {
         bool enemyHit = false;
         for (auto it_bullet = bullets.begin(); it_bullet != bullets.end();) {
@@ -563,16 +654,16 @@ void checkBulletCollisions(Tank& player, int map[20][25]) {
             score++;
             enemiestank--;
             it_enemy = enemies.erase(it_enemy);
-            spawnNewEnemy(player, map);
+            spawnNewEnemy(player, player2, map);
         } else {
             ++it_enemy;
         }
     }
 }
 
-void spawnEnemies() {
+void spawnEnemies(Tank& player, Tank& player2) {
     for (int i = 0; i < 5; ++i) {
-        spawnNewEnemy(player, map);
+        spawnNewEnemy(player, player2, map);
     }
 }
 
@@ -597,27 +688,23 @@ void showGameOver(int finalScore) {
     SDL_DestroyTexture(message);
     SDL_DestroyTexture(score);
     TTF_CloseFont(font);
-    SDL_Delay(4000); // Display Game Over for 4 seconds
+    SDL_Delay(4000);
 
-    // Return to menu instead of closing
     gameOver = true;
     inMenu = true;
 }
 
 void drawMenu() {
     SDL_RenderCopy(renderer, menuTexture, NULL, NULL);
-    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-    SDL_RenderDrawRect(renderer, &startButtonRect);
-    SDL_RenderCopy(renderer, startTextTexture, NULL, &startTextRect);
 
-    // Only draw the Continue button if a game can be loaded
-    std::ifstream saveFile("savegame.txt");
-    if (saveFile.good() && !gameOver) {
-        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-        SDL_RenderDrawRect(renderer, &continueButtonRect);
-        SDL_RenderCopy(renderer, continueTextTexture, NULL, &continueTextRect);
-    }
-    saveFile.close();
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+    SDL_RenderDrawRect(renderer, &onePlayerButtonRect);
+    SDL_RenderCopy(renderer, onePlayerTextTexture, NULL, &onePlayerTextRect);
+
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+    SDL_RenderDrawRect(renderer, &twoPlayerButtonRect);
+    SDL_RenderCopy(renderer, twoPlayerTextTexture, NULL, &twoPlayerTextRect);
+
 }
 
 void saveGame(const std::string& filename) {
@@ -628,6 +715,10 @@ void saveGame(const std::string& filename) {
         file << player.x << std::endl;
         file << player.y << std::endl;
         file << player.hp << std::endl;
+        file << player2.x << std::endl;
+        file << player2.y << std::endl;
+        file << player2.hp << std::endl;
+        file << twoPlayerMode << std::endl;
 
         for (int i = 0; i < 20; ++i) {
             for (int j = 0; j < 25; ++j) {
@@ -637,7 +728,7 @@ void saveGame(const std::string& filename) {
         }
         file << enemies.size() << std::endl;
         for (const auto& enemy : enemies) {
-            file << enemy.x << " " << enemy.y << " " << enemy.hp << " " << enemy.dirX << " " << enemy.dirY << std::endl;
+            file << enemy.x << " " << enemy.y << " " << enemy.hp << " " << enemy.dirX << " " << enemy.dirY << " " << enemy.lastShotTime << " " << enemy.shootInterval << std::endl;
         }
 
         file.close();
@@ -657,6 +748,12 @@ bool loadGame(const std::string& filename) {
         file >> player.hp;
         player.rect.x = player.x;
         player.rect.y = player.y;
+        file >> player2.x;
+        file >> player2.y;
+        file >> player2.hp;
+        player2.rect.x = player2.x;
+        player2.rect.y = player2.y;
+        file >>        twoPlayerMode;
 
         for (int i = 0; i < 20; ++i) {
             for (int j = 0; j < 25; ++j) {
@@ -666,14 +763,18 @@ bool loadGame(const std::string& filename) {
 
         int enemyCount;
         file >> enemyCount;
-        enemies.clear();
+                enemies.clear();
         for (int i = 0; i < enemyCount; ++i) {
             int x, y, hp, dirX, dirY;
-            file >> x >> y >> hp >> dirX >> dirY;
+            Uint32 lastShotTimeLoad;
+            Uint32 shootIntervalLoad;
+            file >> x >> y >> hp >> dirX >> dirY >> lastShotTimeLoad >> shootIntervalLoad;
             EnemyTank enemy(x, y);
             enemy.hp = hp;
             enemy.dirX = dirX;
             enemy.dirY = dirY;
+            enemy.lastShotTime = lastShotTimeLoad; //load lastShotTime from file
+            enemy.shootInterval = shootIntervalLoad;
             enemy.rect.x = x;
             enemy.rect.y = y;
             enemies.push_back(enemy);
@@ -694,6 +795,7 @@ void resetGame() {
     bullets.clear();
     enemyBullets.clear();
     player.hp = 3;
+    player2.hp = 3;
 }
 
 int main(int argc, char* argv[]) {
@@ -704,6 +806,9 @@ int main(int argc, char* argv[]) {
     player.startX = TILE_SIZE;
     player.startY = TILE_SIZE;
     player.resetPosition();
+    player2.startX = SCREEN_WIDTH - 4*TILE_SIZE; // Góc trên bên phải (trừ đi kích thước tank)
+    player2.startY = TILE_SIZE;
+    player2.resetPosition();
 
 
     Uint32 lastMoveTime = 0;
@@ -717,34 +822,81 @@ int main(int argc, char* argv[]) {
             }
             if (inMenu) {
                 if (e.type == SDL_MOUSEBUTTONDOWN) {
-                    if (e.button.x > startButtonRect.x && e.button.x < startButtonRect.x + startButtonRect.w &&
-                        e.button.y > startButtonRect.y && e.button.y < startButtonRect.y + startButtonRect.h) {
+                    if (e.button.x > onePlayerButtonRect.x && e.button.x < onePlayerButtonRect.x + onePlayerButtonRect.w &&
+                        e.button.y > onePlayerButtonRect.y && e.button.y < onePlayerButtonRect.y + onePlayerButtonRect.h) {
                         inMenu = false;
                         gameOver = false;
+                        twoPlayerMode = false;
                         resetGame();
                         generateRandomMap(map);
-                        spawnEnemies();
+                        spawnEnemies(player, player2);
                         giftSpawnTime = SDL_GetTicks() + giftSpawnDelay;
                         player.resetPosition();
                         player.hp = 3;
+                        player2.resetPosition();
+                        player2.hp = 3;
 
                     }
-                     // Handle Continue button click
-                    if (e.button.x > continueButtonRect.x && e.button.x < continueButtonRect.x + continueButtonRect.w &&
-                        e.button.y > continueButtonRect.y && e.button.y < continueButtonRect.y + continueButtonRect.h) {
-                        if (loadGame("savegame.txt")) {
-                            inMenu = false;
-                            gameOver = false;
-                        }
+
+                    else if (e.button.x > twoPlayerButtonRect.x && e.button.x < twoPlayerButtonRect.x + twoPlayerButtonRect.w &&
+                             e.button.y > twoPlayerButtonRect.y && e.button.y < twoPlayerButtonRect.y + twoPlayerButtonRect.h) {
+                        inMenu = false;
+                        gameOver = false;
+                        twoPlayerMode = true;
+                        resetGame();
+                        generateRandomMap(map);
+                        spawnEnemies(player, player2);
+                        giftSpawnTime = SDL_GetTicks() + giftSpawnDelay;
+                        player.resetPosition();
+                         // Set Player 1 spawn
+                        player.startX = TILE_SIZE;
+                        player.startY = TILE_SIZE;
+                        player.x = player.startX;
+                        player.y = player.startY;
+                        player.rect.x = player.x;
+                        player.rect.y = player.y;
+                        player.dirX = 0;
+                        player.dirY = -1;
+                        player.directionTexture = tankDownTexture;
+
+                        // Set Player 2 spawn in the other corner
+                        player2.startX = SCREEN_WIDTH - 4 * TILE_SIZE;
+                        player2.startY = TILE_SIZE;
+                        player2.x = player2.startX;
+                        player2.y = player2.startY;
+                        player2.rect.x = player2.x;
+                        player2.rect.y = player2.y;
+                        player2.dirX = 0;
+                        player2.dirY = -1;
+                        player2.directionTexture = tankDownTexture;
+
+                        player.hp = 3;
+                        player2.hp = 3;
+
                     }
                 }
             }
             else {
-                if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_SPACE) {
-                    player.shoot();
-                }
-                if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_S) {
-                    saveGame("savegame.txt");
+                if (e.type == SDL_KEYDOWN) {
+                    if (!twoPlayerMode) {
+                        if (e.key.keysym.scancode == SDL_SCANCODE_SPACE) {
+                            player.shoot();
+                        }
+                    } else{
+                        if (e.key.keysym.scancode == SDL_SCANCODE_SPACE) {
+                            player.shoot();
+                        }
+                        //Thay doi o day
+                        if (e.key.keysym.scancode == SDL_SCANCODE_J) {
+                            player2.shoot();
+                        }
+                    }
+                    if (e.key.keysym.scancode == SDL_SCANCODE_S) {
+                        saveGame("savegame.txt");
+                    }
+                    if(e.key.keysym.scancode == SDL_SCANCODE_L){
+                        loadGame("savegame.txt");
+                    }
                 }
             }
         }
@@ -759,10 +911,22 @@ int main(int argc, char* argv[]) {
             Uint32 currentTime = SDL_GetTicks();
             if (currentTime - lastMoveTime >= MOVE_DELAY) {
                 const Uint8* keystate = SDL_GetKeyboardState(NULL);
-                if (keystate[SDL_SCANCODE_LEFT]) player.move(-1, 0, tankLeftTexture);
-                else if (keystate[SDL_SCANCODE_RIGHT]) player.move(1, 0, tankRightTexture);
-                else if (keystate[SDL_SCANCODE_UP]) player.move(0, -1, tankUpTexture);
-                else if (keystate[SDL_SCANCODE_DOWN]) player.move(0, 1, tankDownTexture);
+                if (!twoPlayerMode) {
+                    if (keystate[SDL_SCANCODE_LEFT]) player.move(-1, 0, tankLeftTexture);
+                    else if (keystate[SDL_SCANCODE_RIGHT]) player.move(1, 0, tankRightTexture);
+                    else if (keystate[SDL_SCANCODE_UP]) player.move(0, -1, tankUpTexture);
+                    else if (keystate[SDL_SCANCODE_DOWN]) player.move(0, 1, tankDownTexture);
+                } else {
+                    if (keystate[SDL_SCANCODE_LEFT]) player.move(-1, 0, tankLeftTexture);
+                    else if (keystate[SDL_SCANCODE_RIGHT]) player.move(1, 0, tankRightTexture);
+                    else if (keystate[SDL_SCANCODE_UP]) player.move(0, -1, tankUpTexture);
+                    else if (keystate[SDL_SCANCODE_DOWN]) player.move(0, 1, tankDownTexture);
+
+                    if (keystate[SDL_SCANCODE_A]) player2.move(-1, 0, tankLeftTexture);
+                    else if (keystate[SDL_SCANCODE_D]) player2.move(1, 0, tankRightTexture);
+                    else if (keystate[SDL_SCANCODE_W]) player2.move(0, -1, tankUpTexture);
+                    else if (keystate[SDL_SCANCODE_S]) player2.move(0, 1, tankDownTexture);
+                }
                 lastMoveTime = currentTime;
             }
 
@@ -773,15 +937,28 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
                 if (SDL_HasIntersection(&it->rect, &player.rect)) {
-                    player.hp -= 1;
-                    if (player.hp > 0)
-                    {
-                        player.resetPositionAtSpawn();
+                    player.hp -= 1; // Player loses a life
+                    if (player.hp > 0) {
+                       player.resetPositionAtSpawn(); // Reset player position
+                    } else {
+                       showGameOver(score); // Game Over if no lives left
+                       if (twoPlayerMode) {
+                           inMenu = true;
+                       }
                     }
-                    else {
-                        showGameOver(score);
+                    it = enemyBullets.erase(it);
+                    continue;
+                }
+                 if (SDL_HasIntersection(&it->rect, &player2.rect)) {
+                    player2.hp -= 1; // Player loses a life
+                    if (player2.hp > 0) {
+                       player2.resetPositionAtSpawn(); // Reset player position
+                    } else {
+                       showGameOver(score); // Game Over if no lives left
+                       if (twoPlayerMode) {
+                           inMenu = true;
+                       }
                     }
-
                     it = enemyBullets.erase(it);
                     continue;
                 }
@@ -803,6 +980,34 @@ int main(int argc, char* argv[]) {
                 }
                 ++it;
             }
+             // Check collision between player and enemies
+            for (auto it_enemy = enemies.begin(); it_enemy != enemies.end();) {
+                if (SDL_HasIntersection(&player.rect, &it_enemy->rect)) {
+                    player.hp -= 1; // Player loses a life
+                    if (player.hp > 0) {
+                       player.resetPositionAtSpawn(); // Reset player position
+                    } else {
+                       showGameOver(score); // Game Over if no lives left
+                       if (twoPlayerMode) {
+                           inMenu = true;
+                       }
+                    }
+                    break; // Only lose one life per frame if colliding with multiple enemies
+                }
+                if (SDL_HasIntersection(&player2.rect, &it_enemy->rect)) {
+                    player2.hp -= 1; // Player loses a life
+                    if (player2.hp > 0) {
+                       player2.resetPositionAtSpawn(); // Reset player position
+                     } else {
+                       showGameOver(score); // Game Over if no lives left
+                       if (twoPlayerMode) {
+                           inMenu = true;
+                       }
+                     }
+                    break; // Only lose one life per frame if colliding with multiple enemies
+                }
+                ++it_enemy;
+            }
 
             for (auto& enemy : enemies) {
                 enemy.moveLikeHuman();
@@ -816,14 +1021,19 @@ int main(int argc, char* argv[]) {
                 else ++it;
             }
 
-            checkBulletCollisions(player, map);
+            checkBulletCollisions(player, player2, map);
 
             if (giftBox == nullptr && currentTime >= giftSpawnTime) {
                 spawnGiftBox();
             }
 
-            if (giftBox != nullptr && giftBox->active && SDL_HasIntersection(&player.rect, &giftBox->rect)) {
-                player.hp = std::min(player.hp + 1, player.maxHp);
+            if (giftBox != nullptr && giftBox->active && (SDL_HasIntersection(&player.rect, &giftBox->rect) || SDL_HasIntersection(&player2.rect, &giftBox->rect))) {
+                if (SDL_HasIntersection(&player.rect, &giftBox->rect))
+                {
+                     player.hp = std::min(player.hp + 1, player.maxHp);
+                } else {
+                     player2.hp = std::min(player2.hp + 1, player2.maxHp);
+                }
                 giftBox->active = false;
                 delete giftBox;
                 giftBox = nullptr;
@@ -838,10 +1048,16 @@ int main(int argc, char* argv[]) {
 
             drawMap(renderer);
             player.draw();
+            if (twoPlayerMode) {
+                player2.draw();
+            }
             for (auto& enemy : enemies) enemy.draw();
             for (auto& bullet : bullets) bullet.draw();
             for (auto& bullet : enemyBullets) bullet.draw();
             player.drawHearts();
+            if (twoPlayerMode) {
+               player2.drawHearts();
+            }
 
             if (giftBox != nullptr && giftBox->active) {
                 giftBox->draw(renderer, giftTexture);
@@ -865,8 +1081,9 @@ int main(int argc, char* argv[]) {
     SDL_DestroyTexture(steelWallTexture);
     SDL_DestroyTexture(menuTexture);
     SDL_DestroyTexture(startTextTexture);
-    SDL_DestroyTexture(continueTextTexture);
     SDL_DestroyTexture(giftTexture);
+    SDL_DestroyTexture(onePlayerTextTexture);
+    SDL_DestroyTexture(twoPlayerTextTexture);
 
     TTF_CloseFont(menuFont);
     SDL_DestroyRenderer(renderer);
@@ -876,6 +1093,8 @@ int main(int argc, char* argv[]) {
         delete giftBox;
     }
 
+    Mix_FreeChunk(shootSound);
+    Mix_Quit();
     SDL_Quit();
 
     return 0;
